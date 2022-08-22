@@ -100,6 +100,16 @@ public class DataTypes {
 					collectFieldsBetween(field.getDataType(), start, end, fields);
 				}
 			}
+		} else if (type instanceof Union) {
+			Union union = (Union) dedup(type);
+			for (DataTypeComponent field : union.getDefinedComponents()) {
+				int pos = field.getOffset();
+				int start = Math.max(offset, field.getOffset()) - pos;
+				int end = Math.min(endOffset, field.getEndOffset() + 1) - pos;
+				if (start < end) {
+					collectFieldsBetween(field.getDataType(), start, end, fields);
+				}
+			}
 		}
 	}
 
