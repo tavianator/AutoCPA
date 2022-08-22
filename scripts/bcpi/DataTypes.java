@@ -287,9 +287,7 @@ public class DataTypes {
 		}
 
 		String typeName = type.getName();
-		if (typeName.endsWith(DataType.CONFLICT_SUFFIX)) {
-			typeName = typeName.substring(0, typeName.length() - DataType.CONFLICT_SUFFIX.length());
-		}
+		typeName = typeName.replaceAll("\\.conflict\\d*", "");
 
 		if (type instanceof Enum) {
 			specifier.append("enum ");
