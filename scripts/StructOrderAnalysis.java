@@ -16,9 +16,11 @@ import ghidra.app.script.GhidraScript;
 import ghidra.framework.model.DomainFile;
 import ghidra.framework.model.DomainFolder;
 import ghidra.framework.model.DomainObject;
+import ghidra.program.model.data.Composite;
 import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.DataTypeComponent;
 import ghidra.program.model.data.Structure;
+import ghidra.program.model.data.Union;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Program;
 import ghidra.util.Msg;
@@ -38,12 +40,16 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -222,7 +228,13 @@ class FixedFieldConstraint implements ConstraintArg {
  * Analyzes cache misses to suggest reorderings of struct fields.
  */
 public class StructOrderAnalysis extends GhidraScript {
-	private ListMultimap<String, ConstraintArg> constraints = ArrayListMultimap.create();
+	private final ListMultimap<String, ConstraintArg> constraints = ArrayListMultimap.create();
+	private final Set<DataType> types = new HashSet<>();
+	private final ConcurrentMap<DataType, Path> typePaths = new ConcurrentHashMap<>();
+	private final Set<Path> allPaths = ConcurrentHashMap.newKeySet();
+
+	private AccessPatterns patterns;
+	private Path resultsPath;
 
 	@Override
 	public void run() throws Exception {
@@ -268,14 +280,19 @@ public class StructOrderAnalysis extends GhidraScript {
 		refs.collect(funcs);
 
 		// Use our collected data to infer field access patterns
-		AccessPatterns patterns = new AccessPatterns(cfgs, refs);
-		patterns.collect(data);
+		this.patterns = new AccessPatterns(cfgs, refs);
+		this.patterns.collect(data);
 		double hitRate = 100.0 * patterns.getHitRate();
 		Msg.info(this, String.format("Found patterns for %.2f%% of samples", hitRate));
 
+		for (Structure struct : this.patterns.getStructures()) {
+			collectDataTypes(struct);
+		}
+
 		String name = getState().getProject().getName();
-		Path results = Paths.get("./results").resolve(name);
-		render(patterns, results);
+		this.resultsPath = Paths.get("./results").resolve(name);
+
+		render();
 	}
 
 	private List<Program> getAllPrograms() throws Exception {
@@ -286,7 +303,7 @@ public class StructOrderAnalysis extends GhidraScript {
 
 	private void getAllPrograms(DomainFolder folder, List<Program> programs) throws Exception {
 		for (DomainFile file : folder.getFiles()) {
-			DomainObject object = file.getDomainObject(this, true, false, this.monitor);
+			DomainObject object = file.getReadOnlyDomainObject(this, DomainFile.DEFAULT_VERSION, this.monitor);
 			if (object instanceof Program) {
 				programs.add((Program) object);
 			}
@@ -298,20 +315,34 @@ public class StructOrderAnalysis extends GhidraScript {
 	}
 
 	/**
-	 * Sanitize a struct name for a file path.
+	 * Map a type to a filesystem path.
 	 */
-	private static String sanitizeFileName(String name) {
-		String result = name.replaceAll("\\W", "");
+	private Path getTypePath(DataType type) {
+		return this.typePaths.computeIfAbsent(type, t -> {
+			Path folder;
+			if (type instanceof Structure) {
+				folder = this.resultsPath.resolve("structs");
+			} else if (type instanceof Union) {
+				folder = this.resultsPath.resolve("unions");
+			} else {
+				return null;
+			}
 
-		if (result.length() > 32) {
-			result = result.substring(0, 32);
-		}
+			String name = type.getName();
+			name = name.replaceAll("\\W", "");
+			if (name.length() > 32) {
+				name = name.substring(0, 32);
+			}
 
-		if (!result.equals(name)) {
-			result += "_" + Integer.toHexString(name.hashCode());
-		}
+			int n = 0;
+			Path path = folder.resolve(name + ".html");
+			while (!this.allPaths.add(path)) {
+				++n;
+				path = folder.resolve(name + "_" + n + ".html");
+			}
 
-		return result;
+			return path;
+		});
 	}
 
 	/**
@@ -395,18 +426,39 @@ public class StructOrderAnalysis extends GhidraScript {
 		}
 	}
 
+	private void collectDataTypes(Composite type) {
+		if (this.types.add(type)) {
+			for (DataTypeComponent field : type.getDefinedComponents()) {
+				DataType fieldType = field.getDataType();
+				fieldType = DataTypes.undecorate(fieldType);
+				fieldType = DataTypes.resolve(fieldType);
+				if (fieldType instanceof Composite) {
+					collectDataTypes((Composite) DataTypes.dedup(fieldType));
+				}
+			}
+		}
+	}
+
 	/**
 	 * Render all structures to HTML.
 	 */
-	private void render(AccessPatterns patterns, Path results) throws Exception {
+	private void render() throws Exception {
 		Msg.info(this, String.format("Optimizing %,d structures", patterns.getStructures().size()));
 
-		Path structResults = results.resolve("structs");
-		Files.createDirectories(structResults);
+		Files.createDirectories(this.resultsPath.resolve("structs"));
+		Files.createDirectories(this.resultsPath.resolve("unions"));
 
-		List<IndexRow> rows = patterns.getStructures()
+		List<IndexRow> rows = this.types
 			.parallelStream()
-			.map(struct -> {
+			.flatMap(type -> {
+				Path path = getTypePath(type);
+
+				if (type instanceof Union) {
+					renderUnion((Union) type, path);
+					return Stream.empty();
+				}
+
+				Structure struct = (Structure) type;
 				String name = struct.getName();
 
 				StructAbiConstraints constraints = new StructAbiConstraints(struct);
@@ -418,16 +470,15 @@ public class StructOrderAnalysis extends GhidraScript {
 				StructLayoutOptimizer optimizer = new StructLayoutOptimizer(patterns, struct, constraints, costModel);
 				Structure optimized = optimizer.optimize();
 
-				Path path = structResults.resolve(sanitizeFileName(name) + ".html");
-				renderStructs(struct, optimized, patterns, path);
+				renderStructs(struct, optimized, path);
 
 				String text = DataTypes.formatCDecl(struct);
-				String href = results.relativize(path).toString();
+				String href = this.resultsPath.relativize(path).toString();
 				long nSamples = patterns.getCount(struct);
 				long before = costModel.cost(struct);
 				long after = costModel.cost(optimized);
 				long improvement = before - after;
-				return new IndexRow(text, href, nSamples, before, improvement);
+				return Stream.of(new IndexRow(text, href, nSamples, before, improvement));
 			})
 			.sorted(Comparator
 				.<IndexRow>comparingLong(row -> -row.improvement)
@@ -450,7 +501,7 @@ public class StructOrderAnalysis extends GhidraScript {
 			row.costPercent = percent(row.cost, totalCost);
 		}
 
-		Path index = results.resolve("index.html");
+		Path index = this.resultsPath.resolve("index.html");
 		try (PrintWriter out = new PrintWriter(Files.newBufferedWriter(index))) {
 			out.println("<!DOCTYPE html>");
 			out.println("<html>");
@@ -494,9 +545,90 @@ public class StructOrderAnalysis extends GhidraScript {
 	}
 
 	/**
+	 * Render a union to HTML.
+	 */
+	private void renderUnion(Union union, Path path) {
+		try (PrintWriter out = new PrintWriter(Files.newBufferedWriter(path))) {
+			out.println("<!DOCTYPE html>");
+			out.println("<html>");
+
+			out.println("<head>");
+			String structName = htmlEscape(union.getName());
+			String projectName = getState().getProject().getName();
+			out.println("<title>struct " + structName + " - " + projectName + " - BCPI</title>");
+			out.println("<style>");
+			out.println("body {");
+			out.println("    margin: 0;");
+			out.println("}");
+			out.println(".column {");
+			out.println("    padding: 0 8px;");
+			out.println("    max-height: 100vh;");
+			out.println("    overflow-y: scroll;");
+			out.println("}");
+			out.println(".pattern ul {");
+			out.println("    columns: 2;");
+			out.println("    column-fill: auto;");
+			out.println("    max-height: 120px;");
+			out.println("    overflow: scroll;");
+			out.println("}");
+			out.println(".field-ellipsis {");
+			out.println("    display: inline-block;");
+			out.println("    vertical-align: bottom;");
+			out.println("    max-width: 80ch;");
+			out.println("    overflow: hidden;");
+			out.println("    text-overflow: ellipsis;");
+			out.println("}");
+			out.println(".pattern, .field {");
+			out.println("    cursor: default;");
+			out.println("}");
+			out.println(".highlight, .highlight-sticky {");
+			out.println("    background-color: lavender;");
+			out.println("    transition: all 0.2s;");
+			out.println("}");
+			out.println(".highlight-sticky {");
+			out.println("    background-color: thistle;");
+			out.println("}");
+			out.println("pre .highlight, pre .highlight-sticky {");
+			out.println("    font-weight: bold;");
+			out.println("}");
+			out.println(".comment {");
+			out.println("    color: darkslateblue;");
+			out.println("}");
+			out.println("</style>");
+			out.println("<script>");
+			out.println("function highlight(selector, sticky, force) {");
+			out.println("    const className = sticky ? 'highlight-sticky' : 'highlight'");
+			out.println("    document.querySelectorAll(selector)");
+			out.println("        .forEach(e => e.classList.toggle(className, force));");
+			out.println("}");
+			out.println("function highlightSticky(element, selector) {");
+			out.println("    let force = !element.classList.contains('highlight-sticky');");
+			out.println("    highlight('.highlight-sticky', true, false);");
+			out.println("    highlight(selector, true, force);");
+			out.println("}");
+			out.println("</script>");
+			out.println("</head>");
+
+			out.println("<body>");
+			out.println("<main style='display: grid; grid-template-columns: repeat(3, 1fr); grid-template-rows: auto; grid-column-gap: 8px;'>");
+
+			out.println("<div class='column' style='grid-area: 1 / 2 / 2 / 3;'>");
+			renderComposite(union, union, path, out);
+			out.println("</div>");
+
+			out.println("</main>");
+			out.println("</body>");
+
+			out.println("</html>");
+		} catch (Exception e) {
+			throw Throwables.propagate(e);
+		}
+	}
+
+	/**
 	 * Render the pre- and post-optimization structure layouts to HTML.
 	 */
-	private void renderStructs(Structure before, Structure after, AccessPatterns patterns, Path path) {
+	private void renderStructs(Structure before, Structure after, Path path) {
 		try (PrintWriter out = new PrintWriter(Files.newBufferedWriter(path))) {
 			out.println("<!DOCTYPE html>");
 			out.println("<html>");
@@ -563,14 +695,14 @@ public class StructOrderAnalysis extends GhidraScript {
 
 			out.println("<div class='column' style='grid-area: 1 / 1 / 2 / 2;'>");
 			out.println("<p><strong>Access patterns:</strong></p>");
-			renderAccessPatterns(before, patterns, out);
+			renderAccessPatterns(before, out);
 			out.println("</div>");
 
 			CacheCostModel costModel = new CacheCostModel(patterns, before);
 			out.println("<div class='column' style='grid-area: 1 / 2 / 2 / 3;'>");
 			long beforeCost = costModel.cost(before);
 			out.format("<p><strong>Before:</strong> %,d</p>\n", beforeCost);
-			renderStruct(before, before, patterns, out);
+			renderComposite(before, before, path, out);
 			out.println("</div>");
 
 			out.println("<div class='column' style='grid-area: 1 / 3 / 2 / 4;'>");
@@ -578,7 +710,7 @@ public class StructOrderAnalysis extends GhidraScript {
 			long improvement = afterCost - beforeCost;
 			int percentage = percent(improvement, beforeCost);
 			out.format("<p><strong>After:</strong> %,d (%+,d; %+d%%)</p>\n", afterCost, improvement, percentage);
-			renderStruct(before, after, patterns, out);
+			renderComposite(before, after, path, out);
 			out.println("</div>");
 
 			out.println("</main>");
@@ -593,7 +725,7 @@ public class StructOrderAnalysis extends GhidraScript {
 	/**
 	 * Render a structure layout to HTML.
 	 */
-	private void renderStruct(Structure original, Structure struct, AccessPatterns patterns, PrintWriter out) {
+	private void renderComposite(Composite original, Composite struct, Path path, PrintWriter out) {
 		Table table = new Table();
 		table.addColumn(); // Field type
 		table.addColumn(); // Field name
@@ -633,7 +765,7 @@ public class StructOrderAnalysis extends GhidraScript {
 
 			if (Field.isPadding(field)) {
 				padding += field.getLength();
-			} else {
+			} else if (field.getFieldName() != null) {
 				addPadding(table, padding);
 				padding = 0;
 
@@ -676,11 +808,16 @@ public class StructOrderAnalysis extends GhidraScript {
 			table.get(row, commentCol).append("//");
 		}
 
-		List<AccessPattern> structPatterns = patterns.getRankedPatterns(original);
+		List<AccessPattern> structPatterns = Collections.emptyList();
+		long total = 0;
+		if (original instanceof Structure) {
+			structPatterns = patterns.getRankedPatterns((Structure) original);
+			total = patterns.getCount((Structure) original);
+		}
+
 		SetMultimap<String, Integer> fieldPatterns = HashMultimap.create();
 		SetMultimap<Integer, Integer> colPatterns = HashMultimap.create();
 		int count = 0;
-		long total = patterns.getCount(original);
 		final int MAX_COLS = 7;
 		for (AccessPattern pattern : structPatterns) {
 			int patternId = count++;
@@ -752,9 +889,10 @@ public class StructOrderAnalysis extends GhidraScript {
 					DataType type = DataTypes.undecorate(component.getDataType());
 					type = DataTypes.resolve(type);
 					type = DataTypes.dedup(type);
-					if (patterns.getStructures().contains(type)) {
-						String href = sanitizeFileName(type.getName());
-						typeCell.insert(1, "<a href='" + href + ".html'>")
+					if (this.types.contains(type)) {
+						Path typePath = getTypePath(type);
+						String href = path.getParent().relativize(typePath).toString();
+						typeCell.insert(1, "<a href='" + href + "'>")
 							.append("</a>");
 					}
 				}
@@ -888,7 +1026,7 @@ public class StructOrderAnalysis extends GhidraScript {
 	/**
 	 * Render the list of access patterns for a structure to HTML.
 	 */
-	private void renderAccessPatterns(Structure struct, AccessPatterns patterns, PrintWriter out) {
+	private void renderAccessPatterns(Structure struct, PrintWriter out) {
 		out.println("<ul>");
 
 		long total = patterns.getCount(struct);
