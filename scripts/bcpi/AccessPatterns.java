@@ -97,22 +97,24 @@ public class AccessPatterns {
 	 * Record an access pattern and its projections onto sub-structs.
 	 */
 	private void addProjections(AccessPattern pattern, long count, Function func) {
-		Structure struct = (Structure) pattern.getType();
+		Composite type = pattern.getType();
 
-		this.patterns
-			.computeIfAbsent(struct, k -> ConcurrentHashMap.newKeySet())
-			.add(pattern);
-		this.counts
-			.computeIfAbsent(pattern, k -> new LongAdder())
-			.add(count);
-		this.functions
-			.computeIfAbsent(pattern, k -> ConcurrentHashMap.newKeySet())
-			.add(func);
+		if (type instanceof Structure) {
+			this.patterns
+				.computeIfAbsent((Structure) type, k -> ConcurrentHashMap.newKeySet())
+				.add(pattern);
+			this.counts
+				.computeIfAbsent(pattern, k -> new LongAdder())
+				.add(count);
+			this.functions
+				.computeIfAbsent(pattern, k -> ConcurrentHashMap.newKeySet())
+				.add(func);
+		}
 
-		for (DataTypeComponent field : struct.getDefinedComponents()) {
+		for (DataTypeComponent field : type.getDefinedComponents()) {
 			if (pattern.accesses(field)) {
 				AccessPattern proj = pattern.project(field);
-				if (proj != null && proj.getType() instanceof Structure) {
+				if (proj != null) {
 					addProjections(proj, count, func);
 				}
 			}
