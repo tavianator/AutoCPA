@@ -1,0 +1,18 @@
+--- a/src/decompile/cpp/heritage.cc	2022-10-04 17:15:25.647791355 -0400
++++ b/src/decompile/cpp/heritage.cc	2022-10-04 17:11:35.701038635 -0400
+@@ -1244,6 +1244,7 @@
+     // We do not guard the call if the effect is "unaffected" or "reload"
+     if ((effecttype == EffectRecord::unknown_effect)||(effecttype == EffectRecord::return_address)) {
+       indop = fd->newIndirectOp(fc->getOp(),addr,size,0);
++      indop->setStopPropagation();
+       indop->getIn(0)->setActiveHeritage();
+       indop->getOut()->setActiveHeritage();
+       write.push_back(indop->getOut());
+@@ -1254,6 +1255,7 @@
+     }
+     else if (effecttype == EffectRecord::killedbycall) {
+       indop = fd->newIndirectCreation(fc->getOp(),addr,size,possibleoutput);
++      indop->setStopPropagation();
+       indop->getOut()->setActiveHeritage();
+       write.push_back(indop->getOut());
+     }
