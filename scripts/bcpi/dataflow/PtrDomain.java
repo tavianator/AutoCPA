@@ -147,6 +147,7 @@ public class PtrDomain implements SparseDomain<PtrDomain, BcpiVarDomain> {
 			.ofNullable(vn.getHigh())        // Get the high-level variable
 			.map(HighVariable::getDataType)  // Get its type
 			.flatMap(DataTypes::dereference) // Dereference it
+			.filter(t -> t.getLength() > 0)  // Filter out void
 			.map(DataTypes::resolve)         // Resolve typedefs
 			.map(DataTypes::dedup)           // Deduplicate it
 			.map(Flattice::of)               // Wrap in a lattice
@@ -199,7 +200,13 @@ public class PtrDomain implements SparseDomain<PtrDomain, BcpiVarDomain> {
 				var array = ptrs.getInput(op, 0).asArray();
 				var index = ints.getInput(op, 1);
 				var stride = ints.getInput(op, 2);
-				IntDomain offset = index.multiply(stride);
+				var offset = index.multiply(stride);
+				if (array.hasType()) {
+					var size = array.getType().get().getLength();
+					if (stride.equals(IntDomain.constant(size))) {
+						offset = IntDomain.constant(0);
+					}
+				}
 				out = array.plusOffset(offset);
 				break;
 			}
