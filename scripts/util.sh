@@ -23,7 +23,7 @@ ghidra_headless() {
     # Default max memory threshold
     MAXMEM=
     # No custom JVM args
-    VMARG_LIST=
+    VMARG_LIST="-ea"
 
     mkdir -p "$GHIDRA_PROJECTS"
 

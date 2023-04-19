@@ -6,6 +6,9 @@ import bcpi.BcpiDataRow;
 import bcpi.FieldReferences;
 import bcpi.PcodeFormatter;
 
+import ghidra.program.model.address.Address;
+import ghidra.program.model.pcode.PcodeOp;
+
 import java.nio.file.Paths;
 import java.util.Comparator;
 
@@ -56,12 +59,39 @@ public class DebugAnalysis extends BcpiAnalysis {
 		refs.collect(data.getFunctions());
 		data.getRows()
 			.stream()
-			.filter(r -> refs.getFields(r.address).isEmpty())
+			.filter(r -> refs.getFields(unskid(r.address)).isEmpty())
 			.sorted(Comparator.<BcpiDataRow>comparingInt(r -> -r.getCount(BcpiConfig.CACHE_MISS_COUNTER)))
 			.limit(10)
 			.forEach(r -> {
 				System.out.format("%s: %d samples, no struct fields\n",
 					r.address, r.getCount(BcpiConfig.CACHE_MISS_COUNTER));
 			});
+	}
+
+	private Address unskid(Address addr) {
+		var func = getContext().getFunctionContaining(addr);
+		if (func == null) {
+			return addr;
+		}
+
+		var listing = func.getProgram().getListing();
+		var inst = listing.getInstructionAt(addr);
+
+		for (int i = 0; i < 3 && inst != null; ++i) {
+			boolean memRef = false;
+			for (var op : inst.getPcode()) {
+				var opcode = op.getOpcode();
+				if (opcode == PcodeOp.LOAD || opcode == PcodeOp.STORE) {
+					memRef = true;
+					break;
+				}
+			}
+			if (memRef) {
+				return inst.getAddress();
+			}
+			inst = inst.getPrevious();
+		}
+
+		return addr;
 	}
 }

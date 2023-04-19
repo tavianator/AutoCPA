@@ -77,6 +77,20 @@ public class IntDomain implements SparseDomain<IntDomain, IntDomain> {
 	}
 
 	/**
+	 * Calculate the greatest common divisor.
+	 */
+	private static long gcd(long x, long y) {
+		return LongMath.gcd(Math.absExact(x), Math.absExact(y));
+	}
+
+	/**
+	 * 3-argument gcd.
+	 */
+	private static long gcd(long x, long y, long z) {
+		return gcd(gcd(x, y), z);
+	}
+
+	/**
 	 * Reduce modulo a possibly-zero modulus.
 	 */
 	private static long reduce(long offset, long modulus) {
@@ -91,7 +105,13 @@ public class IntDomain implements SparseDomain<IntDomain, IntDomain> {
 	 * Create a new IntDomain, automatically reducing the offset.
 	 */
 	private static IntDomain create(long offset, long modulus) {
-		return new IntDomain(reduce(offset, modulus), Math.abs(modulus));
+		try {
+			modulus = Math.absExact(modulus);
+			offset = reduce(offset, modulus);
+			return new IntDomain(offset, modulus);
+		} catch (ArithmeticException e) {
+			return top();
+		}
 	}
 
 	/**
@@ -184,9 +204,8 @@ public class IntDomain implements SparseDomain<IntDomain, IntDomain> {
 		}
 
 		return map(other, (a, m, b, n) -> {
-			long diff = LongMath.checkedSubtract(Math.max(a, b), Math.min(a, b));
-			long gcd = LongMath.gcd(m, n);
-			gcd = LongMath.gcd(gcd, diff);
+			var diff = Math.subtractExact(Math.max(a, b), Math.min(a, b));
+			var gcd = gcd(m, n, diff);
 			return create(a, gcd);
 		});
 	}
@@ -267,35 +286,46 @@ public class IntDomain implements SparseDomain<IntDomain, IntDomain> {
 	/** @return this + rhs */
 	public IntDomain add(IntDomain rhs) {
 		return map(rhs, (a, m, b, n) -> {
-			var gcd = LongMath.gcd(m, n);
-			var offset = LongMath.checkedAdd(a, b);
+			var offset = Math.addExact(a, b);
+			var gcd = gcd(m, n);
 			return create(offset, gcd);
 		});
+	}
+
+	/** @return this + rhs */
+	public IntDomain add(long rhs) {
+		return add(constant(rhs));
 	}
 
 	/** @return this - rhs */
 	public IntDomain subtract(IntDomain rhs) {
 		return map(rhs, (a, m, b, n) -> {
-			var gcd = LongMath.gcd(m, n);
-			var offset = LongMath.checkedSubtract(a, b);
+			var offset = Math.subtractExact(a, b);
+			var gcd = gcd(m, n);
 			return create(offset, gcd);
 		});
+	}
+
+	/** @return this - rhs */
+	public IntDomain subtract(long rhs) {
+		return subtract(constant(rhs));
 	}
 
 	/** @return this * rhs */
 	public IntDomain multiply(IntDomain rhs) {
 		return map(rhs, (a, m, b, n) -> {
-			//    (a + m*j) * (b + n*k)
-			// == a*b + a*n*k + b*m*j + m*n*j*k
-			var ab = LongMath.checkedMultiply(a, b);
-			var an = LongMath.checkedMultiply(a, n);
-			var bm = LongMath.checkedMultiply(b, m);
-			var mn = LongMath.checkedMultiply(m, n);
-			return constant(ab)
-				.add(multipleOf(an))
-				.add(multipleOf(bm))
-				.add(multipleOf(mn));
+			// See https://math.stackexchange.com/q/4679238/152767
+			var ab = Math.multiplyExact(a, b);
+			var an = Math.multiplyExact(a, n);
+			var bm = Math.multiplyExact(b, m);
+			var mn = Math.multiplyExact(m, n);
+			return create(ab, gcd(gcd(an, bm), mn));
 		});
+	}
+
+	/** @return this * rhs */
+	public IntDomain multiply(long rhs) {
+		return multiply(constant(rhs));
 	}
 
 	/** @return this / rhs */
@@ -303,14 +333,24 @@ public class IntDomain implements SparseDomain<IntDomain, IntDomain> {
 		return rhs.mapConstant(r -> {
 			if (r == 0) {
 				return bottom();
-			} else if (r == 1) {
-				return copy();
-			} else if (r == -1) {
-				return negate();
-			} else {
-				return mapLong(l -> l / r);
 			}
+
+			return map((o, m) -> {
+				if (m % r != 0) {
+					return top();
+				}
+
+				// Negative dividends give a different quotient
+				var pos = create(o / r, m / r);
+				var neg = create((o - m) / r, m / r);
+				return pos.join(neg);
+			});
 		});
+	}
+
+	/** @return this / rhs */
+	public IntDomain divide(long rhs) {
+		return divide(constant(rhs));
 	}
 
 	/** @return this % rhs */
@@ -322,10 +362,10 @@ public class IntDomain implements SparseDomain<IntDomain, IntDomain> {
 
 			return map((o, m) -> {
 				long modulus;
-				if (m == 0 || m % r == 0) {
+				if (m % r == 0) {
 					modulus = 0;
 				} else {
-					modulus = LongMath.gcd(m, Math.abs(r));
+					modulus = gcd(m, r);
 				}
 				// Negative dividends give a different remainder
 				var pos = create(o % r, modulus);
@@ -333,6 +373,11 @@ public class IntDomain implements SparseDomain<IntDomain, IntDomain> {
 				return pos.join(neg);
 			});
 		});
+	}
+
+	/** @return this % rhs */
+	public IntDomain remainder(long rhs) {
+		return remainder(constant(rhs));
 	}
 
 	/** @return |this| % rhs */
@@ -344,14 +389,19 @@ public class IntDomain implements SparseDomain<IntDomain, IntDomain> {
 
 			return map((o, m) -> {
 				long modulus;
-				if (m == 0 || m % r == 0) {
+				if (m % r == 0) {
 					modulus = 0;
 				} else {
-					modulus = LongMath.gcd(m, Math.abs(r));
+					modulus = gcd(m, r);
 				}
 				return create(o % r, modulus);
 			});
 		});
+	}
+
+	/** @return |this| % rhs */
+	public IntDomain mod(long rhs) {
+		return mod(constant(rhs));
 	}
 
 	/** @return this / rhs */
@@ -359,12 +409,23 @@ public class IntDomain implements SparseDomain<IntDomain, IntDomain> {
 		return rhs.mapConstant(r -> {
 			if (r == 0) {
 				return bottom();
-			} else if (r == 1) {
-				return copy();
-			} else {
-				return mapLong(l -> Long.divideUnsigned(l, r));
 			}
+
+			return map((o, m) -> {
+				if (Long.remainderUnsigned(m, r) != 0) {
+					return top();
+				}
+
+				var offset = Long.divideUnsigned(o, r);
+				var modulus = Long.divideUnsigned(m, r);
+				return create(offset, modulus);
+			});
 		});
+	}
+
+	/** @return this / rhs */
+	public IntDomain divideUnsigned(long rhs) {
+		return divideUnsigned(constant(rhs));
 	}
 
 	/** @return this % rhs */
@@ -372,16 +433,11 @@ public class IntDomain implements SparseDomain<IntDomain, IntDomain> {
 		return rhs.mapConstant(r -> {
 			if (r == 0) {
 				return bottom();
-			} else if (r == 1) {
-				return constant(0);
-			} else {
-				// TODO: Figure out join() for unsigned inputs so we can match mod()
-				return mapLong(l -> Long.remainderUnsigned(l, r));
 			}
-			/*
+
 			return map((o, m) -> {
 				long modulus;
-				if (m == 0 || Long.remainderUnsigned(m, r) == 0) {
+				if (Long.remainderUnsigned(m, r) == 0) {
 					modulus = 0;
 				} else {
 					var um = UnsignedLong.fromLongBits(m).bigIntegerValue();
@@ -390,8 +446,12 @@ public class IntDomain implements SparseDomain<IntDomain, IntDomain> {
 				}
 				return create(Long.remainderUnsigned(o, r), modulus);
 			});
-			*/
 		});
+	}
+
+	/** @return this % rhs */
+	public IntDomain remainderUnsigned(long rhs) {
+		return remainderUnsigned(constant(rhs));
 	}
 
 	@FunctionalInterface
@@ -411,7 +471,19 @@ public class IntDomain implements SparseDomain<IntDomain, IntDomain> {
 
 	/** @return this & rhs */
 	public IntDomain and(IntDomain rhs) {
-		return mapLongs(rhs, (l, r) -> l & r);
+		return rhs.mapConstant(r -> {
+			if ((r & (r + 1)) == 0) {
+				// l & 0xFF == l % 0x100
+				return mod(rhs.add(constant(1)));
+			} else {
+				return mapLong(l -> l & r);
+			}
+		});
+	}
+
+	/** @return this & rhs */
+	public IntDomain and(long rhs) {
+		return and(constant(rhs));
 	}
 
 	/** @return this | rhs */
@@ -419,30 +491,67 @@ public class IntDomain implements SparseDomain<IntDomain, IntDomain> {
 		return mapLongs(rhs, (l, r) -> l | r);
 	}
 
+	/** @return this | rhs */
+	public IntDomain or(long rhs) {
+		return or(constant(rhs));
+	}
+
 	/** @return this ^ rhs */
 	public IntDomain xor(IntDomain rhs) {
 		return mapLongs(rhs, (l, r) -> l ^ r);
 	}
 
+	/** @return this ^ rhs */
+	public IntDomain xor(long rhs) {
+		return xor(constant(rhs));
+	}
+
 	/** @return this << rhs */
 	public IntDomain shiftLeft(IntDomain rhs) {
-		return rhs.mapConstant(n -> {
-			if (n < Long.SIZE) {
-				return this.multiply(constant(1L << n));
+		return rhs.mapConstant(r -> {
+			if (r >= 0 && r < Long.SIZE) {
+				return this.multiply(1L << r);
 			} else {
-				return top();
+				return constant(0);
+			}
+		});
+	}
+
+	/** @return this << rhs */
+	public IntDomain shiftLeft(long rhs) {
+		return shiftLeft(constant(rhs));
+	}
+
+	/** @return this >> rhs */
+	public IntDomain shiftRight(IntDomain rhs) {
+		return mapLongs(rhs, (l, r) -> {
+			if (r >= 0 && r < Long.SIZE) {
+				return l >> r;
+			} else {
+				return 0;
 			}
 		});
 	}
 
 	/** @return this >> rhs */
-	public IntDomain shiftRight(IntDomain rhs) {
-		return mapLongs(rhs, (l, r) -> l >> r);
+	public IntDomain shiftRight(long rhs) {
+		return shiftRight(constant(rhs));
 	}
 
 	/** @return this >>> rhs */
 	public IntDomain shiftRightUnsigned(IntDomain rhs) {
-		return mapLongs(rhs, (l, r) -> l >>> r);
+		return mapLongs(rhs, (l, r) -> {
+			if (r >= 0 && r < Long.SIZE) {
+				return l >>> r;
+			} else {
+				return 0;
+			}
+		});
+	}
+
+	/** @return this >>> rhs */
+	public IntDomain shiftRightUnsigned(long rhs) {
+		return shiftRightUnsigned(constant(rhs));
 	}
 
 	/**
@@ -450,8 +559,8 @@ public class IntDomain implements SparseDomain<IntDomain, IntDomain> {
 	 */
 	private IntDomain truncate(Varnode vn) {
 		long bits = 8 * vn.getSize();
-		if (bits < Long.SIZE) {
-			return mod(constant(1L << bits));
+		if (bits < Long.SIZE && isConstant()) {
+			return mod(1L << bits);
 		} else {
 			return copy();
 		}
@@ -462,12 +571,12 @@ public class IntDomain implements SparseDomain<IntDomain, IntDomain> {
 	 */
 	private IntDomain signExtend(Varnode vn) {
 		long bits = 8 * vn.getSize();
-		if (bits >= Long.SIZE) {
+		if (bits < Long.SIZE && isConstant()) {
+			long bit = 1L << bits;
+			return mapConstant(n -> constant((n & bit) == 0 ? n : n | -bit));
+		} else {
 			return copy();
 		}
-
-		long bit = 1L << bits;
-		return mapConstant(n -> constant((n & bit) == 0 ? n : n | -bit));
 	}
 
 	/**
@@ -546,7 +655,7 @@ public class IntDomain implements SparseDomain<IntDomain, IntDomain> {
 
 			case PcodeOp.SUBPIECE:
 				// (l, r) -> l >> 8 * r
-				return binaryOp(op, map, (l, r) -> l.shiftRightUnsigned(r.multiply(constant(8))));
+				return binaryOp(op, map, (l, r) -> l.shiftRightUnsigned(r.multiply(8)));
 
 			case PcodeOp.POPCOUNT:
 				return unaryOp(op, map, IntDomain::bitCount);
@@ -657,7 +766,7 @@ public class IntDomain implements SparseDomain<IntDomain, IntDomain> {
 		}
 	}
 
-	private static final boolean CHECK = true;
+	private static final boolean CHECK = IntDomain.class.desiredAssertionStatus();
 	private static final long CHECK_MIN = -16;
 	private static final long CHECK_MAX = 16;
 
@@ -665,27 +774,19 @@ public class IntDomain implements SparseDomain<IntDomain, IntDomain> {
 	 * Check that the IntDomain implementation of a unary operator is
 	 * consistent with the same operation on longs.
 	 */
-	private static void checkUnary(String op, LongUnaryOperator f, UnaryOperator<IntDomain> g) {
+	private static void checkUnary(LongUnaryOperator f, UnaryOperator<IntDomain> g) {
 		// Check f(x) == g(x) for many x
 		for (long x = CHECK_MIN; x <= CHECK_MAX; ++x) {
 			var ix = constant(x);
 			var fx = f.applyAsLong(x);
 			var gx = g.apply(constant(x));
-			var expected = String.format("%s(%d) == %d", op, x, fx);
-			if (!gx.equals(constant(fx))) {
-				var error = String.format("%s != %s", expected, gx);
-				throw new RuntimeException(error);
-			}
+			assert gx.equals(constant(fx));
 
 			// Check f(x) ∈ g(x ⊔ y) for many y
 			for (long y = CHECK_MIN; y <= CHECK_MAX; ++y) {
 				var xy = ix.join(constant(y));
 				var gxy = g.apply(xy);
-				if (!gxy.contains(fx)) {
-					var actual = String.format("%s(%d ⊔ %d) == %s(%s) == %s", op, x, y, op, xy, gxy);
-					var error = String.format("%s ∉ %s", expected, actual);
-					throw new RuntimeException(error);
-				}
+				assert gxy.contains(fx);
 			}
 		}
 	}
@@ -694,7 +795,7 @@ public class IntDomain implements SparseDomain<IntDomain, IntDomain> {
 	 * Check that the IntDomain implementation of a binary operator is
 	 * consistent with the same operation on longs.
 	 */
-	private static void checkBinary(String op, LongPredicate rhsRange, LongBinaryOperator f, BinaryOperator<IntDomain> g) {
+	private static void checkBinary(LongPredicate rhsRange, LongPredicate joinRange, LongBinaryOperator f, BinaryOperator<IntDomain> g) {
 		// Check f(x, y) == g(x, y) for many x, y
 		for (long x = CHECK_MIN; x <= CHECK_MAX; ++x) {
 			var ix = constant(x);
@@ -707,57 +808,81 @@ public class IntDomain implements SparseDomain<IntDomain, IntDomain> {
 				var iy = constant(y);
 				var fxy = f.applyAsLong(x, y);
 				var gxy = g.apply(ix, iy);
-				var expected = String.format("(%d %s %d) == %d", x, op, y, fxy);
-				if (!gxy.equals(constant(fxy))) {
-					var error = String.format("%s != %s", expected, gxy);
-					throw new RuntimeException(error);
+				assert gxy.equals(constant(fxy));
+
+				if (!joinRange.test(x) || !joinRange.test(y)) {
+					continue;
 				}
 
 				// Check f(x, y) ∈ g(x ⊔ z, y ⊔ w) for many z, w
 				for (long z = CHECK_MIN; z <= CHECK_MAX; ++z) {
+					if (!joinRange.test(z)) {
+						continue;
+					}
+
 					var xz = ix.join(constant(z));
 
 					for (long w = CHECK_MIN; w <= CHECK_MAX; ++w) {
-						if (!rhsRange.test(y)) {
+						if (!rhsRange.test(w) || !joinRange.test(w)) {
 							continue;
 						}
 
 						var yw = iy.join(constant(w));
 						var gxzyw = g.apply(xz, yw);
-						if (!gxzyw.contains(fxy)) {
-							var actual = String.format("((%d ⊔ %d) %s (%d ⊔ %d)) == (%s %s %s) == %s", x, z, op, y, w, xz, op, yw, gxzyw);
-							var error = String.format("%s ∉ %s", expected, actual);
-							throw new RuntimeException(error);
-						}
+						assert gxzyw.contains(fxy);
 					}
 				}
 			}
 		}
 	}
 
-	private static void checkBinary(String op, LongBinaryOperator f, BinaryOperator<IntDomain> g) {
-		checkBinary(op, y -> true, f, g);
+	private static void checkBinary(LongPredicate rhsRange, LongBinaryOperator f, BinaryOperator<IntDomain> g) {
+		checkBinary(rhsRange, n -> true, f, g);
+	}
+
+	private static void checkBinary(LongBinaryOperator f, BinaryOperator<IntDomain> g) {
+		checkBinary(y -> true, f, g);
 	}
 
 	static {
 		if (CHECK) {
-			checkUnary("-", x -> -x, IntDomain::negate);
-			checkUnary("~", x -> ~x, IntDomain::not);
-			checkUnary("bitCount", Long::bitCount, IntDomain::bitCount);
+			// Correctness checks
+			checkUnary(x -> -x, IntDomain::negate);
+			checkUnary(x -> ~x, IntDomain::not);
+			checkUnary(Long::bitCount, IntDomain::bitCount);
 
-			checkBinary("+", (x, y) -> x + y, IntDomain::add);
-			checkBinary("-", (x, y) -> x - y, IntDomain::subtract);
-			checkBinary("*", (x, y) -> x * y, IntDomain::multiply);
+			checkBinary((x, y) -> x + y, IntDomain::add);
+			checkBinary((x, y) -> x - y, IntDomain::subtract);
+			checkBinary((x, y) -> x * y, IntDomain::multiply);
 
-			checkBinary("/", y -> y != 0, (x, y) -> x / y, IntDomain::divide);
-			checkBinary("%", y -> y != 0, (x, y) -> x % y, IntDomain::remainder);
+			checkBinary(y -> y != 0, (x, y) -> x / y, IntDomain::divide);
+			checkBinary(y -> y != 0, (x, y) -> x % y, IntDomain::remainder);
 
-			checkBinary("/u", y -> y != 0, Long::divideUnsigned, IntDomain::divideUnsigned);
-			checkBinary("%u", y -> y != 0, Long::remainderUnsigned, IntDomain::remainderUnsigned);
+			checkBinary(y -> y != 0, n -> n >= 0, Long::divideUnsigned, IntDomain::divideUnsigned);
+			checkBinary(y -> y != 0, n -> n >= 0, Long::remainderUnsigned, IntDomain::remainderUnsigned);
 
-			checkBinary("<<", y -> y >= 0, (x, y) -> x << y, IntDomain::shiftLeft);
-			checkBinary(">>", y -> y >= 0, (x, y) -> x >> y, IntDomain::shiftRight);
-			checkBinary(">>>", y -> y >= 0, (x, y) -> x >>> y, IntDomain::shiftRightUnsigned);
+			checkBinary(y -> y >= 0, (x, y) -> x << y, IntDomain::shiftLeft);
+			checkBinary(y -> y >= 0, (x, y) -> x >> y, IntDomain::shiftRight);
+			checkBinary(y -> y >= 0, (x, y) -> x >>> y, IntDomain::shiftRightUnsigned);
+
+			// QOI checks
+			var max = constant(Long.MAX_VALUE);
+			assert max.add(max).equals(top());
+
+			assert top().multiply(3).equals(multipleOf(3));
+
+			assert multipleOf(8).divide(2).equals(multipleOf(4));
+			assert create(2, 8).divide(2).equals(create(1, 4));
+			assert create(5, 8).divideUnsigned(2).equals(create(2, 4));
+			assert constant(1).divide(0).equals(bottom());
+
+			assert create(1, 3).mod(3).equals(constant(1));
+			assert create(1, 9).mod(3).equals(constant(1));
+			assert create(1, 3).mod(9).equals(create(1, 3));
+			assert create(1, 3).mod(4).equals(top());
+			assert constant(1).mod(0).equals(bottom());
+
+			assert create(1, 16).and(0xF).equals(constant(1));
 		}
 	}
 }
